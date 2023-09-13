@@ -1,14 +1,13 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from ...autotune_process import CUDABenchmarkRequest
-from ...ir import Callable, CUDATemplateBuffer, IRNode, Layout, TensorBox
+from ...ir import IRNode, TemplateBuffer, TensorBox
 from ...select_algorithm import ChoiceCaller
 from ...utils import sympy_product
 from ...virtualized import V
 
 from ..common import IndentedBuffer, Kernel, OpOverrides
 from ..cpp import CppPrinter, DTYPE_TO_CPP
-
 
 cexpr = CppPrinter().doprint
 
@@ -32,10 +31,7 @@ class CUDATemplateKernel(CUDAKernel):
 
     _EXTRA_CPP_ARGS = "size_t* workspace_size, uint8_t* workspace, cudaStream_t stream"
 
-    def __init__(
-        self,
-        kernel_name,
-    ):
+    def __init__(self, kernel_name):
         super().__init__()
         self.kernel_name = kernel_name
         # Mapping from arg name to IRNode.
@@ -126,7 +122,7 @@ class CUDATemplateKernel(CUDAKernel):
         arg_defs, *_ = self.args.cpp_argdefs()
         return f"PT_EXPORT int {self.kernel_name}({', '.join(arg_defs)}, {self._EXTRA_CPP_ARGS})"
 
-    def call_kernel(self, name: str, node: CUDATemplateBuffer) -> None:
+    def call_kernel(self, name: str, node: "CUDATemplateBuffer") -> None:
         """
         Generates code to call the kernel through V.graph.wrapper_code.
 
@@ -265,20 +261,109 @@ class CUDATemplateKernel(CUDAKernel):
             )
 
 
+class CUDATemplateBuffer(TemplateBuffer):
+    def __init__(
+        self,
+        template: "CUDATemplate",
+        op: "cutlass_gemm_op.GemmOperation",  # TODO: Update type once we have other op-types
+        epilogue_nodes: Optional[
+            List[IRNode]
+        ] = None,  # We need a new instance of this op every time we fuse
+        get_workspace_size_callback: Callable[
+            [], int
+        ] = None,  # This is not known at construction time, so we need a callback
+        **render_kwargs,  # passed through to template_node.render
+    ):
+        if epilogue_nodes is None:
+            epilogue_nodes = []
+        input_nodes = self._merge_inputs(epilogue_nodes, template)
+        super().__init__(template.layout, input_nodes, self._make_kernel_render)
+        self.template = template
+        self.op = op
+        self._epilogue_nodes = epilogue_nodes
+        # TODO: Once we support non-pointwise fusions, layout might be modified by epilogues
+        self.layout = template.layout
+        self._render_kwargs = render_kwargs
+        # Global memory (in bytes) needed for this template.
+        self._get_workspace_size = get_workspace_size_callback
+
+    @staticmethod
+    def _merge_inputs(epilogue_nodes, template):
+        # Merge all inputs, including extra inputs from epilogue_nodes
+        # input nodes are not hashable, so we cannot directly place them in sets
+        template_input_id_set = set([id(node) for node in template.input_nodes])
+        total_input_id_set = set(template_input_id_set)
+        extra_inputs = []
+        for epilogue_node in epilogue_nodes:
+            for node in epilogue_node.input_nodes:
+                if id(node) not in total_input_id_set:
+                    extra_inputs.append(node)
+                    total_input_id_set.add(id(node))
+        input_nodes = list(template.input_nodes) + extra_inputs
+        return input_nodes
+
+    @property
+    def epilogue_nodes(self):
+        # read-only property to signal it should not be mutated
+        return self._epilogue_nodes
+
+    @property
+    def workspace_size(self):
+        return self.get_workspace_size()
+
+    def get_workspace_size(self):
+        return (
+            self._get_workspace_size() if not (self._get_workspace_size is None) else 0
+        )
+
+    def _kernel_render(self):
+        kernel = CUDATemplateKernel(
+            kernel_name="KERNEL_NAME",
+        )
+        return self.template.render(
+            kernel=kernel, output_node=self, op=self.op, **self._render_kwargs
+        )
+
+    def _make_kernel_render(self, output_node):
+        assert output_node is self
+        assert self.workspace_size >= 0
+        return self._kernel_render
+
+    def get_scheduler_node_class(self):
+        from torch._inductor.scheduler import CUDASchedulerNode
+
+        return CUDASchedulerNode
+
+    def can_fuse_epilogue(self, node):
+        self.template.can_fuse_epilogue(node)
+
+
 class CUDATemplateCaller(ChoiceCaller):
+    """
+    CUDATemplateCaller
+
+    This class represents a caller for CUDA template kernels. It is a subclass of ChoiceCaller.
+    Attributes:
+        name (str): The name of the caller.
+        category (str): The category of the caller.
+        bmreq (CUDABenchmarkRequest): The benchmark request for the caller.
+        template_buffer (CUDATemplateBuffer): The template buffer for the caller.
+    """
+
     def __init__(
         self,
         name: str,
         category: str,
-        input_nodes: List[IRNode],
-        layout: Layout,
-        make_kernel_render: Callable[[str], str],
         bmreq: CUDABenchmarkRequest,
+        template_buffer: CUDATemplateBuffer,
     ):
-        super().__init__(name, input_nodes, layout)
+        super().__init__(
+            name, template_buffer.template.input_nodes, template_buffer.layout
+        )
         self.category = category
-        self.make_kernel_render = make_kernel_render
         self.bmreq = bmreq
+
+        self.template_buffer = template_buffer
 
     def benchmark(self, *args, out) -> float:
         assert self.bmreq is not None
@@ -299,11 +384,4 @@ class CUDATemplateCaller(ChoiceCaller):
         )
 
     def output_node(self) -> TensorBox:
-        return TensorBox.create(
-            CUDATemplateBuffer(
-                layout=self.layout,
-                inputs=self.input_nodes,
-                make_kernel_render=self.make_kernel_render,
-                workspace_size=self.bmreq.workspace_size,
-            )
-        )
+        return TensorBox.create(self.template_buffer)

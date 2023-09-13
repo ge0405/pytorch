@@ -1,10 +1,17 @@
+from unittest.mock import patch
+
 from ... import config
 from ...codecache import code_hash, get_path
+from ...ir import CUDATemplateBuffer
 from ...utils import get_fused_kernel_name, get_kernel_metadata
 from ...virtualized import V
 
 from ..common import IndentedBuffer
 from ..triton import TritonScheduling
+
+from . import cutlass_epilogue_gen
+from .cuda_template import CUDATemplate
+from .cutlass_epilogue_gen import CutlassEpilogueFormatterHandler
 
 
 class CUDAScheduling(TritonScheduling):
@@ -41,3 +48,26 @@ class CUDAScheduling(TritonScheduling):
                 kernel_name, compile_wrapper.getvalue(), metadata_comment
             )
         return kernel_name
+
+    def codegen_template(self, template_node, epilogue_nodes):
+        """
+        Codegen a CUDA template
+        """
+        _, (numel, rnumel) = template_node.group
+        assert rnumel == 1
+        assert isinstance(template_node.node, CUDATemplateBuffer)
+        kernel, render = template_node.node.make_kernel_render(template_node.node)
+        epilogue_init_list = []
+        epilogue_param_list = []
+        with kernel:
+            for node in [template_node, *epilogue_nodes]:
+                node.mark_run()
+            src_code = render()
+
+        with V.set_kernel_handler(kernel):
+            node_schedule = [template_node, *epilogue_nodes]
+            kernel_name = self.define_kernel(src_code, node_schedule)
+        self.codegen_comment(node_schedule)
+        kernel.call_kernel(kernel_name, template_node.node)
+        V.graph.removed_buffers |= kernel.removed_buffers
+        self.scheduler.free_buffers()

@@ -2927,25 +2927,10 @@ class TemplateBuffer(Buffer):
             None,
         )
 
-
 class TritonTemplateBuffer(TemplateBuffer):
     pass
 
 
-class CUDATemplateBuffer(TemplateBuffer):
-    def __init__(
-        self,
-        layout,
-        inputs,
-        make_kernel_render,
-        workspace_size: int = 0,
-    ):
-        super().__init__(layout, inputs, make_kernel_render)
-        # Global memory (in bytes) needed for this template.
-        self.workspace_size = workspace_size
-
-    def get_workspace_size(self):
-        return self.workspace_size if self.workspace_size is not None else 0
 
 
 @dataclasses.dataclass
