@@ -164,6 +164,7 @@ def speculate_subgraph(
     #       argument.
     manually_set_subgraph_inputs=True,
     restore_side_effects=True,
+    should_flatten_outputs=False,
 ):
     if sub_kwargs is None:
         sub_kwargs = {}
@@ -193,6 +194,12 @@ def speculate_subgraph(
 
             with autograd_ctx:
                 output = f.call_function(tx, args, sub_kwargs)
+
+            if should_flatten_outputs:
+                maybe_unwrap_tree_flatten = UserFunctionVariable(
+                    pytree._maybe_unwrap_tree_flatten
+                )
+                output = maybe_unwrap_tree_flatten.call_function(tx, [output], {})
 
             if restore_side_effects:
                 # Captured variables are tracked in side-effects
@@ -1097,6 +1104,7 @@ class WrapHigherOrderVariable(TorchHigherOrderOperatorVariable):
             checkpoint,
             description,
             manually_set_subgraph_inputs=False,
+            should_flatten_outputs=True,
         )
 
         body_name = add_subgraph(
