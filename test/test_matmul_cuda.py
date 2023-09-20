@@ -1,10 +1,16 @@
 # Owner(s): ["module: linear algebra"]
 
 import unittest
+from itertools import product
 from functools import partial
 from typing import Optional
 
 import torch
+
+from torch.quantization._quantized_conversions import (
+    quantized_weight_reorder_for_mixed_dtypes_linear,
+)
+
 from torch.testing import make_tensor
 from torch.testing._internal.common_cuda import SM53OrLater
 from torch.testing._internal.common_device_type import (
@@ -277,8 +283,82 @@ class TestFP8MatmulCuda(TestCase):
 
 
 
+@unittest.skipIf(TEST_WITH_ROCM, "ROCm doesn't support CUTLASS")
+@unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8, "mixed dtypes MM only supported on SM 8.x")
+class TestMixedDtypesLinearCuda(TestCase):
+    @dtypes(torch.float16, torch.bfloat16)
+    def test_mixed_dtypes_linear(self, dtype: torch.dtype, device: str = "cuda"):
+        def run_test(
+            batch_shape, m, n, k, add_bias, activation, dtype, device, rtol, atol
+        ):
+            if not add_bias and activation != "none":
+                return
+
+            val_lo, val_hi = -1, 1
+            valq_lo, valq_hi = -2, 2
+            input = make_tensor(
+                *batch_shape, m, k, low=val_lo, high=val_hi, dtype=dtype, device=device
+            )
+            weight = make_tensor(
+                n, k, low=valq_lo, high=valq_hi, dtype=torch.int8, device=device
+            )
+            scale = make_tensor(
+                (n,), low=val_lo, high=val_hi, dtype=input.dtype, device=device
+            )
+            bias = (
+                make_tensor(
+                    (n,), low=val_lo, high=val_hi, dtype=input.dtype, device=device
+                )
+                if add_bias
+                else None
+            )
+
+            input_ref = input.reshape(-1, input.shape[-1])
+            weight_ref = weight.to(input.dtype) * scale.view(n, 1)
+            bias_ref = bias.view(1, n) if add_bias else None
+            output_ref = torch.nn.functional.linear(
+                input_ref, weight_ref, bias=bias_ref
+            ).reshape(*input.shape[:-1], n)
+            if activation == "relu":
+                relu = torch.nn.ReLU()
+                output_ref = relu(output_ref)
+            elif activation == "silu":
+                silu = torch.nn.SiLU()
+                output_ref = silu(output_ref)
+
+            output = torch.ops.aten._mixed_dtypes_linear(
+                input,
+                quantized_weight_reorder_for_mixed_dtypes_linear(weight),
+                scale,
+                bias=bias,
+                activation=activation,
+            )
+
+            torch.testing.assert_close(output, output_ref, rtol=rtol, atol=atol)
+
+        batch_shapes = [[], [2], [2, 1]]
+        shapes = [
+            [8, 64, 64],
+            [8, 64, 128],
+            [8, 128, 64],
+            [8, 128, 128],
+            [8, 128, 192],
+            [8, 128, 256],
+            [8, 256, 128],
+            [8, 256, 384],
+            [8, 384, 256],
+        ]
+        activations = [None, "relu", "silu"]
+        rtol, atol = 1e-3, 1e-3
+        if dtype == torch.bfloat16:
+            rtol, atol = 1e-2, 1e-3
+        for batch_shape, (m, n, k), add_bias, activation in \
+            product(batch_shapes, shapes, (False, True), activations):
+            run_test(batch_shape, m, n, k, add_bias, activation, dtype, device, rtol, atol)
+        
 instantiate_device_type_tests(TestMatmulCuda, globals(), except_for="cpu")
 instantiate_device_type_tests(TestFP8MatmulCuda, globals(), except_for="cpu")
+instantiate_device_type_tests(TestMixedDtypesLinearCuda, globals(), except_for="cpu")
 
 if __name__ == '__main__':
     TestCase._default_dtype_check_enabled = True
