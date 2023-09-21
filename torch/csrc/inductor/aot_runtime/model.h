@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -31,11 +32,11 @@
             std::to_string(actual_size));                         \
   } while (0)
 
-#define AOTI_TORCH_ERROR_CODE_CHECK(call)                                 \
-  if ((call) != AOTI_TORCH_SUCCESS) {                                     \
-    throw std::runtime_error(                                             \
-        std::string(#call " API call failed at ") + __FILE__ + ", line" + \
-        std::to_string(__LINE__));                                        \
+#define AOTI_TORCH_ERROR_CODE_CHECK(call)                                  \
+  if ((call) != AOTI_TORCH_SUCCESS) {                                      \
+    throw std::runtime_error(                                              \
+        std::string(#call " API call failed at ") + __FILE__ + ", line " + \
+        std::to_string(__LINE__));                                         \
   }
 
 using DeleterFnPtr = void (*)(void*);
@@ -135,11 +136,17 @@ class AOTInductorModelBase {
         outputs_info_(num_outputs),
         constants_info_(num_constants),
         cubin_dir_(cubin_dir) {
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventCreate(&run_finished_));
+    AOTI_RUNTIME_CUDA_CHECK(cudaGetDevice(&device_idx_));
   }
 
-  ~AOTInductorModelBase() noexcept(false) {
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventDestroy(run_finished_));
+  ~AOTInductorModelBase() {
+    if (run_finished_) {
+      auto code = cudaEventDestroy(*run_finished_);
+      if (code != cudaSuccess) {
+        std::cerr << "Failed to destroy CUDA event in AOTInductor model: "
+                  << cudaGetErrorString(code) << std::endl;
+      }
+    }
   }
 
   AOTInductorModelBase(AOTInductorModelBase&&) = delete;
@@ -157,10 +164,15 @@ class AOTInductorModelBase {
       AOTIProxyExecutorHandle proxy_executor = nullptr) {
     AOTI_VECTOR_SIZE_CHECK(inputs, num_inputs(), "inputs");
     AOTI_VECTOR_SIZE_CHECK(outputs, num_outputs(), "outputs");
+    if (!run_finished_) {
+      cudaEvent_t run_finished;
+      AOTI_RUNTIME_CUDA_CHECK(cudaEventCreate(&run_finished));
+      run_finished_.emplace(run_finished);
+    }
 
     auto* model = static_cast<Model*>(this);
     model->run_impl(inputs, outputs, stream, proxy_executor);
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventRecord(run_finished_, stream));
+    AOTI_RUNTIME_CUDA_CHECK(cudaEventRecord(*run_finished_, stream));
   }
 
   size_t num_inputs() const {
@@ -237,7 +249,11 @@ class AOTInductorModelBase {
 
   /// Returns true if the model is complete.
   bool is_finished() {
-    auto event_status = cudaEventQuery(run_finished_);
+    if (!run_finished_) {
+      throw std::runtime_error{"Model CUDA event was not initialized"};
+    }
+
+    auto event_status = cudaEventQuery(*run_finished_);
     if (event_status == cudaSuccess) {
       return true;
     } else if (event_status == cudaErrorNotReady) {
@@ -251,7 +267,11 @@ class AOTInductorModelBase {
 
   /// Synchronizes completion event.
   void wait_for_completion() {
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventSynchronize(run_finished_));
+    if (!run_finished_) {
+      throw std::runtime_error{"Model CUDA event was not initialized"};
+    }
+
+    AOTI_RUNTIME_CUDA_CHECK(cudaEventSynchronize(*run_finished_));
   }
 
  protected:
@@ -373,7 +393,10 @@ class AOTInductorModelBase {
 
   // Record if the model finishes an inference run so that its owning
   // AOTModelContainer can re-use this instance.
-  cudaEvent_t run_finished_;
+  std::optional<cudaEvent_t> run_finished_;
+
+  // Generated model uses this device index to create CUDA guards.
+  int device_idx_;
 
  protected:
   std::vector<std::unique_ptr<StaticDimInfo>> static_dims_;
