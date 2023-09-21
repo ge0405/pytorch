@@ -8,7 +8,8 @@ from typing import Optional
 import torch
 
 from torch.quantization._quantized_conversions import (
-    quantized_weight_reorder_for_mixed_dtypes_linear,
+    pack_int4_to_int8,
+    quantized_weight_reorder_for_mixed_dtypes_linear_cutlass,
 )
 
 from torch.testing import make_tensor
@@ -282,14 +283,13 @@ class TestFP8MatmulCuda(TestCase):
         )
 
 
-
 @unittest.skipIf(TEST_WITH_ROCM, "ROCm doesn't support CUTLASS")
 @unittest.skipIf(not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8, "mixed dtypes MM only supported on SM 8.x")
 class TestMixedDtypesLinearCuda(TestCase):
     @dtypes(torch.float16, torch.bfloat16)
     def test_mixed_dtypes_linear(self, dtype: torch.dtype, device: str = "cuda"):
         def run_test(
-            batch_shape, m, n, k, add_bias, activation, dtype, device, rtol, atol
+            batch_shape, m, n, k, add_bias, activation, dtype, dtypeq, device, rtol, atol
         ):
             if not add_bias and activation != "none":
                 return
@@ -326,9 +326,12 @@ class TestMixedDtypesLinearCuda(TestCase):
                 silu = torch.nn.SiLU()
                 output_ref = silu(output_ref)
 
+            if dtypeq == torch.quint4x2:
+                weight = pack_int4_to_int8(weight)
+
             output = torch.ops.aten._mixed_dtypes_linear(
                 input,
-                quantized_weight_reorder_for_mixed_dtypes_linear(weight),
+                quantized_weight_reorder_for_mixed_dtypes_linear_cutlass(weight, dtypeq),
                 scale,
                 bias=bias,
                 activation=activation,
@@ -336,6 +339,7 @@ class TestMixedDtypesLinearCuda(TestCase):
 
             torch.testing.assert_close(output, output_ref, rtol=rtol, atol=atol)
 
+        dtypeqs = (torch.int8, torch.quint4x2)
         batch_shapes = [[], [2], [2, 1]]
         shapes = [
             [8, 64, 64],
@@ -352,10 +356,10 @@ class TestMixedDtypesLinearCuda(TestCase):
         rtol, atol = 1e-3, 1e-3
         if dtype == torch.bfloat16:
             rtol, atol = 1e-2, 1e-3
-        for batch_shape, (m, n, k), add_bias, activation in \
-            product(batch_shapes, shapes, (False, True), activations):
-            run_test(batch_shape, m, n, k, add_bias, activation, dtype, device, rtol, atol)
-        
+        for dtypeq, batch_shape, (m, n, k), add_bias, activation in \
+            product(dtypeqs, batch_shapes, shapes, (False, True), activations):
+            run_test(batch_shape, m, n, k, add_bias, activation, dtype, dtypeq, device, rtol, atol)
+
 instantiate_device_type_tests(TestMatmulCuda, globals(), except_for="cpu")
 instantiate_device_type_tests(TestFP8MatmulCuda, globals(), except_for="cpu")
 instantiate_device_type_tests(TestMixedDtypesLinearCuda, globals(), except_for="cpu")
