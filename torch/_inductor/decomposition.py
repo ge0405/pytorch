@@ -29,6 +29,7 @@ quantized_decomposed = torch.ops.quantized_decomposed
 inductor_decompositions = get_decompositions(
     [
         aten._adaptive_avg_pool2d_backward,
+        aten.addmm,
         aten.arange,
         aten.bitwise_and_,
         aten.bitwise_or_,
@@ -194,7 +195,7 @@ def all_dim(input, dim, keepdim=False):
 
 @register_decomposition([aten.bmm])
 def bmm(self, batch2):
-    if self.device == "cpu":
+    if self.device.type == "cpu":
         if self.size(1) == 1 and batch2.size(-1) == 1:
             return torch.sum(
                 self.squeeze(1) * batch2.squeeze(-1), dim=1, keepdim=True
@@ -209,7 +210,7 @@ def mm(self, input2):
     if config.coordinate_descent_tuning:
         if self.shape[0] == 1 or input2.shape[1] == 1:
             return (self.unsqueeze(2) * input2.unsqueeze(0)).sum(dim=1)
-    if self.device == "cpu":
+    if self.device.type == "cpu":
         if (
             self.size(-1) == 1
             and input2.size(0) == 1
