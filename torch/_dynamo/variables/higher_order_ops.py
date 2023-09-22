@@ -322,6 +322,8 @@ class TorchHigherOrderOperatorVariable(VariableTracker):
             return CheckpointHigherOrderVariable(value, source, **kwargs)
         elif value.__name__ == "_export_tracepoint":
             return ExportTracepointHigherOrderVariable(value, source, **kwargs)
+        elif value.__name__ == "trace_wrapped":
+            return TraceWrappedHigherOrderOperatorVariable(value, source, **kwargs)
         else:
             unimplemented(f"HigherOrderOperator {value.__name__}")
 
@@ -1228,3 +1230,13 @@ class ExportTracepointHigherOrderVariable(TorchHigherOrderOperatorVariable):
             ),
             example_value=None,
         )
+
+
+class TraceWrappedHigherOrderOperatorVariable(TorchHigherOrderOperatorVariable):
+    def call_function(
+        self, tx, args: "List[VariableTracker]", kwargs: "Dict[str, VariableTracker]"
+    ) -> "VariableTracker":
+        assert "fn" in kwargs
+        fn = kwargs["fn"]
+        # just inline into the function, Dynamo doesn't do anything special with the higher order operator
+        return fn.call_function(tx, args, {})
